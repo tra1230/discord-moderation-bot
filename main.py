@@ -1,97 +1,137 @@
-import os
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 import logging
+import os
+from datetime import datetime
+import json
 
-# Load environment variables
-load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.FileHandler('bot_logs.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-# Initialize Discord bot with intents
-intents = discord.Intents.all()
+intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.guilds = True
-
+intents.dm_messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Bot startup event
+user_warnings = {}
+mod_logs = []
+
+def log_action(action_type, user, moderator, reason, details=None):
+    log_entry = {'timestamp': datetime.now().isoformat(), 'action': action_type, 'user': str(user), 'moderator': str(moderator) if moderator else 'System', 'reason': reason, 'details': details}
+    mod_logs.append(log_entry)
+    logger.info(f"MOD: {action_type} on {user} - {reason}")
+    with open('moderation_logs.json', 'a') as f:
+        f.write(json.dumps(log_entry) + '\n')
+
 @bot.event
 async def on_ready():
-    logger.info(f'{bot.user} has connected to Discord!')
-    logger.info('Bot is ready for moderation')
+    logger.info(f'Bot logged in as {bot.user}')
+    await bot.change_presence(activity=discord.Game(name='!help'))
 
-# Welcome message on member join
 @bot.event
 async def on_member_join(member):
-    guild = member.guild
-    logger.info(f'{member} has joined {guild.name}')
+    logger.info(f'Member joined: {member}')
+    log_action('member_join', member, None, 'Member joined')
 
-# Message moderation
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
-    logger.info(f'{message.author}: {message.content}')
+    if isinstance(message.channel, discord.DMChannel):
+        logger.info(f'DM from {message.author}: {message.content}')
+        response = await process_dm_with_ai(message.author, message.content)
+        try:
+            await message.author.send(response)
+        except Exception as e:
+            logger.error(f'Failed to send DM: {e}')
     await bot.process_commands(message)
 
-# Moderation commands
-@bot.command(name='warn')
-async def warn_user(ctx, member: discord.Member, *, reason='No reason provided'):
-    await ctx.send(f'{member} has been warned. Reason: {reason}')
-    logger.warning(f'{member} warned by {ctx.author}. Reason: {reason}')
+async def process_dm_with_ai(user, content):
+    msg = content.lower()
+    if 'help' in msg:
+        return "Use !warn, !mute, !kick, !ban, !unmute, !logs in servers. I help moderate Discord communities!"
+    elif 'who' in msg or 'what' in msg:
+        return "I'm a Discord moderation bot with AI-powered decision making and comprehensive logging!"
+    elif 'hi' in msg or 'hello' in msg:
+        return f"Hello {user.mention}! How can I help?"
+    else:
+        return "Thanks for reaching out! I'm here to help moderate. Ask me about moderation commands!"
 
-@bot.command(name='kick')
-async def kick_user(ctx, member: discord.Member, *, reason='No reason provided'):
-    try:
-        await member.kick(reason=reason)
-        await ctx.send(f'{member} has been kicked. Reason: {reason}')
-        logger.info(f'{member} kicked by {ctx.author}. Reason: {reason}')
-    except discord.Forbidden:
-        await ctx.send('I do not have permission to kick this user.')
+@bot.command()
+async def warn(ctx, member: discord.Member, *, reason='No reason'):
+    if member == ctx.author:
+        await ctx.send("Can't warn yourself!")
+        return
+    if member.id not in user_warnings:
+        user_warnings[member.id] = []
+    user_warnings[member.id].append({'reason': reason, 'timestamp': datetime.now().isoformat()})
+    count = len(user_warnings[member.id])
+    log_action('warn', member, ctx.author, reason, {'count': count})
+    embed = discord.Embed(title="User Warned", description=f"{member.mention} warned", color=discord.Color.orange())
+    embed.add_field(name="Reason", value=reason)
+    embed.add_field(name="Total Warnings", value=str(count))
+    await ctx.send(embed=embed)
 
-@bot.command(name='ban')
-async def ban_user(ctx, member: discord.Member, *, reason='No reason provided'):
-    try:
-        await member.ban(reason=reason)
-        await ctx.send(f'{member} has been banned. Reason: {reason}')
-        logger.info(f'{member} banned by {ctx.author}. Reason: {reason}')
-    except discord.Forbidden:
-        await ctx.send('I do not have permission to ban this user.')
-
-@bot.command(name='mute')
-async def mute_user(ctx, member: discord.Member):
+@bot.command()
+async def mute(ctx, member: discord.Member, *, reason='No reason'):
     muted_role = discord.utils.get(ctx.guild.roles, name='Muted')
     if not muted_role:
         muted_role = await ctx.guild.create_role(name='Muted')
     await member.add_roles(muted_role)
-    await ctx.send(f'{member} has been muted.')
-    logger.info(f'{member} muted by {ctx.author}')
+    log_action('mute', member, ctx.author, reason)
+    embed = discord.Embed(title="User Muted", description=f"{member.mention} muted", color=discord.Color.red())
+    embed.add_field(name="Reason", value=reason)
+    await ctx.send(embed=embed)
 
-@bot.command(name='unmute')
-async def unmute_user(ctx, member: discord.Member):
+@bot.command()
+async def unmute(ctx, member: discord.Member, *, reason='No reason'):
     muted_role = discord.utils.get(ctx.guild.roles, name='Muted')
-    if muted_role in member.roles:
+    if muted_role and muted_role in member.roles:
         await member.remove_roles(muted_role)
-        await ctx.send(f'{member} has been unmuted.')
-        logger.info(f'{member} unmuted by {ctx.author}')
-    else:
-        await ctx.send(f'{member} is not muted.')
+    log_action('unmute', member, ctx.author, reason)
+    embed = discord.Embed(title="User Unmuted", description=f"{member.mention} unmuted", color=discord.Color.green())
+    await ctx.send(embed=embed)
 
-@bot.command(name='ping')
+@bot.command()
+async def kick(ctx, member: discord.Member, *, reason='No reason'):
+    log_action('kick', member, ctx.author, reason)
+    await member.kick(reason=reason)
+    embed = discord.Embed(title="User Kicked", description=f"{member} kicked", color=discord.Color.red())
+    embed.add_field(name="Reason", value=reason)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def ban(ctx, member: discord.Member, *, reason='No reason'):
+    log_action('ban', member, ctx.author, reason)
+    await member.ban(reason=reason)
+    embed = discord.Embed(title="User Banned", description=f"{member} banned", color=discord.Color.dark_red())
+    embed.add_field(name="Reason", value=reason)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def logs(ctx, user: discord.Member = None):
+    user_logs = [log for log in mod_logs if user and str(log.get('user')) == str(user)] if user else mod_logs[-10:]
+    embed = discord.Embed(title="Moderation Logs", description=f"{len(user_logs)} entries", color=discord.Color.blue())
+    for log_entry in user_logs[-5:]:
+        embed.add_field(name=f"{log_entry['action'].upper()}", value=f"User: {log_entry['user']}\nReason: {log_entry['reason']}", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
 async def ping(ctx):
-    latency = bot.latency * 1000
-    await ctx.send(f'Pong! Latency: {latency:.2f}ms')
+    latency = f"{round(bot.latency * 1000)}ms"
+    embed = discord.Embed(title="Pong!", description=f"Latency: {latency}", color=discord.Color.green())
+    logger.info(f"Ping: {latency}")
+    await ctx.send(embed=embed)
 
-@bot.command(name='status')
+@bot.command()
 async def status(ctx):
-    await ctx.send('Bot is online and operational!')
+    embed = discord.Embed(title="Bot Status", description="Online and operational", color=discord.Color.green())
+    embed.add_field(name="Guilds", value=len(bot.guilds))
+    embed.add_field(name="Logs", value=len(mod_logs))
+    await ctx.send(embed=embed)
 
 if __name__ == '__main__':
-    logger.info('Starting Discord bot...')
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+    logger.info('Starting bot...')
     bot.run(BOT_TOKEN)
